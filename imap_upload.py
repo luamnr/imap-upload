@@ -296,7 +296,7 @@ class Progress():
                 gmail_sent_str = r"Sent"
                 gmail_draft_str = "Draft"
                 gmail_important_str = u'Important'
-                gmail_open_str = u'Open'
+                gmail_open_str = r'^(?:Open|Opened)$'
                 gmail_unseen_str = u"Unread"
                 gmail_category_str = r"^Category_"
                 gmail_imap_str = r'^IMAP_'
@@ -367,8 +367,7 @@ class Progress():
                 sanitized_labels.append(sanitized_label)
             labels = sanitized_labels
 
-            if labels.count(gmail_open_str) > 0:
-                labels.remove(gmail_open_str)
+            labels = [l for l in labels if not re.match(gmail_open_str, l)]
 
             if labels.count(u'INBOX') > 0:
                 labels.remove(u'INBOX')
