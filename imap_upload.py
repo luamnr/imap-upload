@@ -123,6 +123,8 @@ class MyOptionParser(OptionParser):
                         help="Debug: Make some error messages more verbose.")
         self.add_option("--dry-run", action="store_true",
                         help="Do not perform IMAP writing actions")
+        self.add_option("--skip-duplicates", action="store_true",
+                        help="Skip messages that already exist on the server (checks by Message-ID)")
         self.set_defaults(host="localhost",
                           ssl=False,
                           r=False,
@@ -141,8 +143,9 @@ class MyOptionParser(OptionParser):
                           google_takeout_language="en",
                           maximum_size_exceeded_are_warnings=False,
                           debug=False,
-                          dry_run=False,
-                          )
+                           dry_run=False,
+                           skip_duplicates=False,
+                           )
 
     def enable_gmail(self, option, opt_str, value, parser):
         parser.values.ssl = True
@@ -273,6 +276,7 @@ class Progress():
         self.total_count = total_count
         self.ok_count = 0
         self.warning_count = 0
+        self.skip_count = 0
         self.count = 0
         self.format = "%" + str(len(str(total_count))) + "d/" + \
                       str(total_count) + " %5.1f %-2s  %s  "
@@ -443,10 +447,15 @@ class Progress():
         self.warning_count += 1
         print("WARNING (%s)" % err)
 
+    def endSkip(self, reason):
+        """Called when a message is skipped (e.g. duplicate)."""
+        self.skip_count += 1
+        print("SKIP (%s)" % reason)
+
     def endAll(self):
         """Called when all message was processed."""
-        print("Done. (OK: %d, WARNING: %d, ERROR: %d)" % \
-              (self.ok_count, self.warning_count, (self.total_count - self.ok_count - self.warning_count)))
+        print("Done. (OK: %d, SKIP: %d, WARNING: %d, ERROR: %d)" % \
+              (self.ok_count, self.skip_count, self.warning_count, (self.total_count - self.ok_count - self.skip_count - self.warning_count)))
 
 
 def upload(imap, box, src, err, time_fields, google_takeout=False, google_takeout_first_label=False,
@@ -471,14 +480,26 @@ def upload(imap, box, src, err, time_fields, google_takeout=False, google_takeou
                         msg_boxes.append(msg_box)
                 else:
                     msg_boxes = msg.boxes
+                any_ok = False
+                skip_reasons = []
                 for i in range(len(msg_boxes)):
                     r, r2 = imap.upload(box, msg.get_delivery_time(time_fields),
                                         ImapUploadMessage.as_string(msg), msg.flags, msg_boxes[i], 3)
-                    if r != "OK":
+                    if r == "SKIP":
+                        skip_reasons.append(r2)
+                    elif r != "OK":
                         raise Exception(r2[0]) # FIXME: Should use custom class
+                    else:
+                        any_ok = True
+                if not any_ok and skip_reasons:
+                    p.endSkip("; ".join(skip_reasons))
+                    continue
             else:
                 r, r2 = imap.upload(box, msg.get_delivery_time(time_fields),
                                     ImapUploadMessage.as_string(msg), None, None, 3)
+                if r == "SKIP":
+                    p.endSkip(r2)
+                    continue
                 if r != "OK":
                     raise Exception(r2[0]) # FIXME: Should use custom class
 
@@ -635,7 +656,7 @@ mailbox.mboxMessage.get_delivery_time = get_delivery_time
 
 
 class IMAPUploader:
-    def __init__(self, host, port, ssl, box, user, password, retry, folder_separator, dry_run):
+    def __init__(self, host, port, ssl, box, user, password, retry, folder_separator, dry_run, skip_duplicates=False):
         self.imap = None
         self.host = host
         self.port = port
@@ -647,6 +668,7 @@ class IMAPUploader:
         self.created_directories_cache = []
         self.separator = folder_separator
         self.dry_run = dry_run
+        self.skip_duplicates = skip_duplicates
 
     def upload(self, box, delivery_time, message, flags = None, google_takeout_box_path = None, retry = None):
         if retry is None:
@@ -661,12 +683,22 @@ class IMAPUploader:
             if google_takeout_box_path is not None: # Google Takeout
                 self.create_folder(google_takeout_box_path)
                 google_takeout_box = self.separator.join(google_takeout_box_path)
-                google_takeout_box_imap_command = '"' + google_takeout_box + '"'
-                return self.imap.append(imap_utf7.encode(google_takeout_box_imap_command), flags, delivery_time, message)
+                box_imap_command = '"' + google_takeout_box + '"'
             else: # Default behaviour
                 box_imap_command = '"' + box + '"'
                 self.imap_create(imap_utf7.encode(box_imap_command))
-                return self.imap.append(imap_utf7.encode(box_imap_command), flags, delivery_time, message)
+            box_encoded = imap_utf7.encode(box_imap_command)
+            if self.skip_duplicates:
+                msg_id = self._get_message_id(message)
+                if msg_id:
+                    try:
+                        self.imap.select(box_encoded, readonly=True)
+                        typ, data = self.imap.search(None, 'HEADER', 'Message-ID', msg_id)
+                        if data and data[0]:
+                            return ("SKIP", "Duplicate Message-ID already exists: %s" % msg_id)
+                    except Exception:
+                        pass
+            return self.imap.append(box_encoded, flags, delivery_time, message)
         except (imaplib.IMAP4.abort, socket.error):
             self.close()
             if retry == 0:
@@ -690,6 +722,17 @@ class IMAPUploader:
         if box not in self.created_directories_cache:
             self.imap.create(box)
             self.created_directories_cache.append(box)
+
+    @staticmethod
+    def _get_message_id(message):
+        try:
+            msg = email.message_from_bytes(message)
+            msg_id = msg.get("Message-ID")
+            if msg_id:
+                return msg_id.strip()
+        except Exception:
+            pass
+        return None
 
     def enable_dry_run(self):
         def dummy_create(a):
